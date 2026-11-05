@@ -181,8 +181,16 @@ def assess(repo, git_dir, pr):
         flags.append(f"binary/asset files: {', '.join(bins[:3])}")
     if re.search(r"\bintegration\b|\bbatch\b", d["title"], re.I):
         flags.append("integration/batch PR: merge commit + full look, not this skill")
-    if d["mergeable"] == "CONFLICTING":
+    mergeable = d["mergeable"]
+    # ponytail: GitHub computes mergeability lazily; UNKNOWN on first ask, so ask once more.
+    if mergeable == "UNKNOWN":
+        out = subprocess.run(["gh", "pr", "view", str(pr["number"]), "-R", repo, "--json", "mergeable", "-q", ".mergeable"],
+                             capture_output=True, text=True)
+        mergeable = out.stdout.strip() or "UNKNOWN"
+    if mergeable == "CONFLICTING":
         flags.append("conflicts with main")
+    elif mergeable != "MERGEABLE":
+        flags.append(f"mergeability {mergeable}: GitHub hasn't computed it, rescan later")
     ci, ci_names = ci_state(d)
     if ci != "green":
         flags.append(f"CI {ci}" + (f": {', '.join(ci_names[:4])}" if ci_names else " (fork run not approved?)"))
