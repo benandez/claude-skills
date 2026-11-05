@@ -6,6 +6,7 @@ Prints a markdown report: MERGE CANDIDATES (need the light read + Martin's pick)
 FLAGGED (excluded, with reasons). Read-only: never merges, comments or pushes.
 """
 import argparse, json, re, subprocess, sys
+from collections import Counter
 
 MAX_LINES, MAX_FILES = 2500, 50
 TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}
@@ -70,8 +71,62 @@ def approval_state(pr):
         if r["state"] == "CHANGES_REQUESTED":
             blockers.append(login)
         elif r["state"] == "APPROVED" and r["authorAssociation"] in TRUSTED:
-            (on_head if (r["commit"] or {}).get("oid") == pr["headRefOid"] else stale).append(login)
+            oid = (r["commit"] or {}).get("oid")
+            if oid == pr["headRefOid"]:
+                on_head.append(login)
+            else:
+                stale.append((login, oid))
     return on_head, stale, blockers
+
+
+SMALL_INTERDIFF = 20  # code lines changed since approval that a quick re-review can cover
+
+
+def code_change(git_dir, ref):
+    """The PR's net added/removed lines against main, per file, docs excluded. Line numbers and
+    context are ignored, so a rebase (or code moving under it) leaves this unchanged."""
+    base = git(git_dir, "merge-base", "origin/main", ref).stdout.strip()
+    if not base:
+        return None
+    diff = git(git_dir, "diff", base, ref, "--", ".", ":(exclude)ROADMAP.md", ":(exclude)docs/*.md").stdout
+    return [l for l in diff.splitlines() if l[:1] in "+-" and not l.startswith(("+++ ", "--- "))
+            or l.startswith("diff --git")]
+
+
+def approval_drift(git_dir, number, stale):
+    """(carried, small): stale approvers whose approved code change equals the head's (a rebase,
+    docs or trailers only), and {approver: n} for those within SMALL_INTERDIFF code lines."""
+    ref = f"refs/scan/pr-{number}"
+    if git(git_dir, "fetch", "-q", "origin", f"+refs/pull/{number}/head:{ref}").returncode != 0:
+        return [], {}
+    head = code_change(git_dir, ref)
+    carried, small = [], {}
+    for login, oid in stale:
+        if not oid or head is None:
+            continue
+        if git(git_dir, "cat-file", "-e", oid).returncode != 0:
+            git(git_dir, "fetch", "-q", "origin", oid)
+        approved = code_change(git_dir, oid) if git(git_dir, "cat-file", "-e", oid).returncode == 0 else None
+        if approved is None:
+            continue
+        # ponytail: multiset difference of lines, ignores order; good enough to size a re-review.
+        delta = sum(((Counter(head) - Counter(approved)) + (Counter(approved) - Counter(head))).values())
+        if delta == 0:
+            carried.append(login)
+        elif delta <= SMALL_INTERDIFF:
+            small[login] = delta
+    return carried, small
+
+
+def conflict_files(git_dir, number):
+    """Files that conflict when the PR head merges into origin/main, or None if unknown."""
+    out = git(git_dir, "merge-tree", "--write-tree", "--name-only", "origin/main", f"refs/scan/pr-{number}")
+    if out.returncode not in (0, 1):
+        return None
+    return sorted({l.split(" in ", 1)[1] for l in out.stdout.splitlines() if l.startswith("CONFLICT") and " in " in l})
+
+
+DOCS_ONLY = re.compile(r"^(ROADMAP|README|CHANGELOG)\.md$|^docs/.*\.md$")
 
 
 def ci_state(d):
@@ -155,10 +210,12 @@ def diff_findings(repo, git_dir, number):
     return panics, new_cmds
 
 
-def assess(repo, git_dir, pr):
+def assess(repo, git_dir, pr, carried=()):
     owner, name = repo.split("/")
     d = gh_graphql(DETAIL_Q, owner=owner, name=name, n=pr["number"])["pullRequest"]
     on_head, _, _ = approval_state(pr)
+    if git_dir:  # conflict_files needs the head before main_drift fetches it
+        git(git_dir, "fetch", "-q", "origin", f"+refs/pull/{pr['number']}/head:refs/scan/pr-{pr['number']}")
     flags, checks = [], []
     files = d["files"]["nodes"]
     paths = [f["path"] for f in files]
@@ -187,17 +244,26 @@ def assess(repo, git_dir, pr):
         out = subprocess.run(["gh", "pr", "view", str(pr["number"]), "-R", repo, "--json", "mergeable", "-q", ".mergeable"],
                              capture_output=True, text=True)
         mergeable = out.stdout.strip() or "UNKNOWN"
+    conflicts = None
     if mergeable == "CONFLICTING":
-        flags.append("conflicts with main")
+        conflicts = conflict_files(git_dir, pr["number"]) if git_dir else None
+        if conflicts and all(DOCS_ONLY.search(p) for p in conflicts):
+            flags.append(f"conflicts with main, docs only ({', '.join(conflicts)}): rebase request")
+        else:
+            flags.append("conflicts with main" + (f" ({', '.join(conflicts[:4])})" if conflicts else ""))
     elif mergeable != "MERGEABLE":
         flags.append(f"mergeability {mergeable}: GitHub hasn't computed it, rescan later")
     ci, ci_names = ci_state(d)
     if ci != "green":
         flags.append(f"CI {ci}" + (f": {', '.join(ci_names[:4])}" if ci_names else " (fork run not approved?)"))
-    unresolved = [t for t in d["reviewThreads"]["nodes"] if not t["isResolved"] and not t["isOutdated"]]
+    open_threads = [t for t in d["reviewThreads"]["nodes"] if not t["isResolved"]]
+    unresolved = [t for t in open_threads if not t["isOutdated"]]
     if unresolved:
         who = sorted({(t["comments"]["nodes"] or [{}])[0].get("author", {}).get("login", "?") for t in unresolved})
         flags.append(f"{len(unresolved)} unresolved review thread(s) ({', '.join(who)})")
+    if outdated := len(open_threads) - len(unresolved):
+        # Outdated is not addressed (#2905: the code moved, the bug stayed). The light pass checks each.
+        checks.append(f"{outdated} outdated open thread(s): check each was addressed")
     drift = main_drift(git_dir, pr["number"], paths) if git_dir else None
     panics, new_cmds = diff_findings(repo, git_dir, pr["number"])
     if new_cmds:
@@ -212,7 +278,8 @@ def assess(repo, git_dir, pr):
             checks.append(f"{behind} commits behind main; main also changed {', '.join(overlap[:4])} - CI may be stale")
     return {
         "number": d["number"], "title": d["title"], "url": d["url"],
-        "author": (pr["author"] or {}).get("login", "ghost"), "approvers": on_head,
+        "author": (pr["author"] or {}).get("login", "ghost"), "approvers": on_head + [f"{l} (carried: same diff)" for l in carried],
+        "conflicts": conflicts,
         "size": f"+{d['additions']}/-{d['deletions']} ({d['changedFiles']}f)",
         "head": d["headRefOid"], "cross_repo": d["isCrossRepository"],
         "flags": flags, "checks": checks,
@@ -237,21 +304,26 @@ def main():
             break
         after = page["pageInfo"]["endCursor"]
 
-    candidates, flagged, stale_list = [], [], []
+    candidates, flagged, stale_list, small_list = [], [], [], []
     for pr in prs:
         if pr["isDraft"] or pr["baseRefName"] != "main":
             continue
         on_head, stale, blockers = approval_state(pr)
         author = (pr["author"] or {}).get("login", "ghost")
-        if not on_head:
-            if stale:
-                stale_list.append((pr["number"], pr["title"], stale))
+        carried, small = [], {}
+        if not on_head and stale and a.git_dir:
+            carried, small = approval_drift(a.git_dir, pr["number"], stale)
+        if not on_head and not carried:
+            if small:
+                small_list.append((pr["number"], pr["title"], small))
+            elif stale:
+                stale_list.append((pr["number"], pr["title"], [l for l, _ in stale]))
             continue
         if author.lower() in BLOCKED_AUTHORS:
             flagged.append({"number": pr["number"], "title": pr["title"], "author": author,
                             "flags": ["author is PierrunoYT - flag to Martin, never merge"]})
             continue
-        r = assess(a.repo, a.git_dir, pr)
+        r = assess(a.repo, a.git_dir, pr, carried)
         if blockers:
             r["flags"].insert(0, f"changes requested by {', '.join(blockers)}")
         (flagged if r["flags"] else candidates).append(r)
@@ -264,11 +336,18 @@ def main():
     print(f"\n## Flagged, excluded ({len(flagged)})\n\n| PR | Title | Author | Why |\n|---|---|---|---|")
     for r in flagged:
         print(f"| #{r['number']} | {r['title'][:70]} | {r['author']} | {'; '.join(r['flags'] + r.get('checks', []))} |")
-    print(f"\n## Approval is stale - new commits since approval ({len(stale_list)})\n")
+    docs_only = [r for r in flagged if any("docs only" in f for f in r["flags"])]
+    print(f"\n## Docs-only conflicts ({len(docs_only)}): send the rebase-request template\n")
+    print(", ".join(f"#{r['number']}" for r in docs_only) or "none")
+    print(f"\n## Small change since approval ({len(small_list)}): quick re-review (Sonnet) of the interdiff\n")
+    for n, t, s in small_list:
+        print(f"- #{n} {t[:70]}: " + ", ".join(f"{l} approved, {d} code lines differ" for l, d in s.items()))
+    print(f"\n## Approval is stale - the diff changed since approval ({len(stale_list)})\n")
     print(", ".join(f"#{n}" for n, _, _ in stale_list) or "none")
     if a.json:
         with open(a.json, "w") as f:
             json.dump({"candidates": candidates, "flagged": flagged,
+                       "small_interdiff": [{"number": n, "title": t, "delta": s} for n, t, s in small_list],
                        "stale": [{"number": n, "title": t, "approvers": s} for n, t, s in stale_list]}, f, indent=1)
 
 
