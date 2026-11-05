@@ -315,7 +315,8 @@ def main():
             carried, small = approval_drift(a.git_dir, pr["number"], stale)
         if not on_head and not carried:
             if small:
-                small_list.append((pr["number"], pr["title"], small))
+                c = conflict_files(a.git_dir, pr["number"])
+                small_list.append((pr["number"], pr["title"], small, c))
             elif stale:
                 stale_list.append((pr["number"], pr["title"], [l for l, _ in stale]))
             continue
@@ -340,14 +341,15 @@ def main():
     print(f"\n## Docs-only conflicts ({len(docs_only)}): send the rebase-request template\n")
     print(", ".join(f"#{r['number']}" for r in docs_only) or "none")
     print(f"\n## Small change since approval ({len(small_list)}): quick re-review (Sonnet) of the interdiff\n")
-    for n, t, s in small_list:
-        print(f"- #{n} {t[:70]}: " + ", ".join(f"{l} approved, {d} code lines differ" for l, d in s.items()))
+    for n, t, s, c in small_list:
+        print(f"- #{n} {t[:70]}: " + ", ".join(f"{l} approved, {d} code lines differ" for l, d in s.items())
+              + (f"; CONFLICTS: {', '.join(c[:4])} (rebase first)" if c else ""))
     print(f"\n## Approval is stale - the diff changed since approval ({len(stale_list)})\n")
     print(", ".join(f"#{n}" for n, _, _ in stale_list) or "none")
     if a.json:
         with open(a.json, "w") as f:
             json.dump({"candidates": candidates, "flagged": flagged,
-                       "small_interdiff": [{"number": n, "title": t, "delta": s} for n, t, s in small_list],
+                       "small_interdiff": [{"number": n, "title": t, "delta": s, "conflicts": c} for n, t, s, c in small_list],
                        "stale": [{"number": n, "title": t, "approvers": s} for n, t, s in stale_list]}, f, indent=1)
 
 
