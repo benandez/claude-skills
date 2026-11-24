@@ -1,6 +1,6 @@
 ---
 name: reviewing-prs
-description: Use when reviewing someone else's pull request, deciding Approve vs Request changes vs Comment, posting a review verdict, re-reviewing a PR after new commits, or batch-testing several PRs together - including when a build and manual test already passed.
+description: "Review someone else's PR and pick Approve / Request changes / Comment, incl. re-reviews and batch-testing PRs."
 ---
 
 # Reviewing PRs
@@ -20,6 +20,12 @@ CI green only covers the scenarios its tests cover. "Tests pass" is not evidence
 7. **Second reviewer for risky PRs.** If the diff touches revisions/authorship, protection, caches or revision counters, untrusted-input parsing, or batches a per-call path: run a second independent review (fresh subagent, this skill, no sight of the first) and merge the findings. Single runs miss different P2s.
 8. **Give the verdict** using the severity rule and output contract.
 
+## Model routing (when delegating reviews to subagents)
+Pass `model` on every review subagent — never let it inherit by default.
+- **Sonnet** (default): data/content PRs — translation catalogs, strings, docs, config, fixtures; small code diffs that add no new logic; re-reviews that only check whether earlier findings were fixed.
+- **Opus**: any code with new logic — parsers, validators/checkers, plural or locale rules, migrations; anything on the step-7 risky list; the second reviewer in step 7; settling disagreements between two reviews; a PR that competes with or overrides another.
+- **Escalate**: if a Sonnet review returns a source-traced P1/P2 it isn't sure of, or reports "can't tell", rerun that PR on Opus before giving the verdict.
+
 ## Axes
 | Axis | Ask |
 |---|---|
@@ -32,6 +38,7 @@ CI green only covers the scenarios its tests cover. "Tests pass" is not evidence
 | Sibling branches | Is a variant handled (left/centre/right, each enum arm, each format)? Check the arms the tests skip, and whether tests would pass if that arm were wrong. |
 | Captured once, used many | List **every** variable assigned before a loop or split and read inside it. For each: does the loop body change what it was derived from (style, paragraph, selection, position)? |
 | Replaced path | When N calls become one batched call, or a helper replaces a sequence: list what the old path recomputed per call (properties, styles, permissions, autoformat, events). Each one now computed once or skipped is a candidate finding. |
+| Security fix covers the root cause | A PR fixing a security finding: does it include a test that enumerates **every** site of the root cause (table, exhaustive match), so a new site fails CI? A test of only the reproduced case = P1. |
 | Hostile input and cost | Lengths, counts, repeats from files or commands: capped? Panic paths? Quadratic work on input still under the caps? |
 
 ## Severity rule
